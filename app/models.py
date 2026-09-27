@@ -438,3 +438,79 @@ class PrivacyExportOut(BaseModel):
     suppressed_trip_count: int
     classes: list[PrivacyEquivalenceClass]
     trips: list[PrivacyExportTrip]
+
+
+# ---------------------------------------------------------------------------
+# Sudden-disruption evacuation replanning
+# ---------------------------------------------------------------------------
+
+
+class ReplanStopIn(BaseModel):
+    station_id: str = Field(min_length=1, max_length=64)
+    arrival_at: datetime    # any ISO-8601 offset accepted, normalised to UTC
+    departure_at: datetime
+
+
+class ReplanServiceIn(BaseModel):
+    service_id: str = Field(min_length=1, max_length=128)
+    capacity: int = Field(
+        ge=0,
+        description="Rated capacity of the replacement service on every section",
+    )
+    stops: list[ReplanStopIn] = Field(
+        min_length=2,
+        description="Stops in station order; at least two form one section",
+    )
+
+
+class ReplanGroupIn(BaseModel):
+    group_id: str = Field(min_length=1, max_length=128)
+    origin: str = Field(min_length=1, max_length=64)
+    destination: str = Field(min_length=1, max_length=64)
+    ready_at: datetime      # earliest UTC time the whole party can board
+    party_size: int = Field(ge=1)  # indivisible party
+
+
+class DisruptionReplanIn(BaseModel):
+    replan_id: str = Field(min_length=1, max_length=128)
+    min_transfer_seconds: int = Field(
+        ge=0,
+        description="Minimum gap between arriving on one service and departing on the next",
+    )
+    services: list[ReplanServiceIn] = Field(default_factory=list)
+    groups: list[ReplanGroupIn] = Field(default_factory=list)
+
+
+class ReplanLeg(BaseModel):
+    service_id: str
+    from_station: str
+    to_station: str
+    departure_at: str       # departure from from_station, UTC
+    arrival_at: str         # arrival at to_station, UTC
+
+
+class ReplanGroupResult(BaseModel):
+    group_id: str
+    origin: str
+    destination: str
+    ready_at: str
+    party_size: int
+    status: Literal["assigned", "stranded"]
+    arrival_at: str | None = None       # null while stranded
+    transfers: int | None = None        # legs - 1; null while stranded
+    legs: list[ReplanLeg]
+    stranded_reason: str | None = None
+
+
+class ReplanSummary(BaseModel):
+    group_count: int
+    assigned_count: int
+    stranded_count: int
+
+
+class DisruptionReplanOut(BaseModel):
+    replan_id: str
+    status: Literal["created", "duplicate"]
+    min_transfer_seconds: int
+    summary: ReplanSummary
+    groups: list[ReplanGroupResult]

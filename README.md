@@ -1,6 +1,6 @@
 # 公共交通票价结算 API
 
-基于 FastAPI + SQLite 的公交/地铁票价结算与换乘网络校验服务。客户端提交刷卡事件，服务按事件时间配对行程，依据可配置的分区票价、换乘优惠以及 UTC 自然日 / 自然周（ISO 周，周一起算）封顶规则计算应收金额；迟到或更正的记录会触发受影响乘客全量重算并返回每段行程的计费依据与调账差额。此外提供 `POST /reconciliations` 扣款对账接口，按出站时间快照内部行程费用，与外部扣款明细进行批次化一对一核对。`POST /network/validate` 还可对带生效时间的换乘网络（线路段 + 步行换乘边）按时间边界切片构图，校验枢纽可达性、双向换乘对称性、重复 / 自环边与重叠生效区间；通过的版本可用 `POST /network/snapshots` 固化并随时查询。票价争议通过 `POST /disputes` 提起（创建时冻结行程收费快照、申请额不得超过快照应收）、`POST /disputes/{id}/resolve` 凭乐观版本一次性结案并写入不可变退款流水；结案后若行程因事件更正而重算，`GET /disputes/{id}` 会实时报告待补退 / 待追回差额而不覆盖已结退款。此外提供 `POST /event-quality/scans` 刷卡事件质量扫描：在 UTC 半开区间内按 `(occurred_at, seq)` 扫描事件，识别窗口内重复同类刷卡与出站后未达到站点最短行程秒数便再次进站的时序冲突，结果只写入独立的只追加表，可随时用 `GET /event-quality/scans/{id}` 查询，绝不改动事件、行程、账单或审计。最后提供 `POST /privacy/exports` 匿名出行轨迹导出：在 UTC 半开区间（按进站时间）内读取行程，用服务器配置的 `PRIVACY_SALT` 对 `passenger_id` 做稳定 HMAC 假名化（同一乘客跨多段行程、跨多次导出保持同一假名），按（纪元对齐的 UTC 时间桶、起点站组、终点站组）统计去重乘客数，等价类人数不足最小群体 `k` 时**整组抑制**（不逐行泄露），只返回保留行程的假名 / 时间桶 / 站点组；结果只追加保存，相同 `export_id` 同载荷幂等、不同载荷 `409`，可用 `GET /privacy/exports/{id}` 查询。
+基于 FastAPI + SQLite 的公交/地铁票价结算与换乘网络校验服务。客户端提交刷卡事件，服务按事件时间配对行程，依据可配置的分区票价、换乘优惠以及 UTC 自然日 / 自然周（ISO 周，周一起算）封顶规则计算应收金额；迟到或更正的记录会触发受影响乘客全量重算并返回每段行程的计费依据与调账差额。此外提供 `POST /reconciliations` 扣款对账接口，按出站时间快照内部行程费用，与外部扣款明细进行批次化一对一核对。`POST /network/validate` 还可对带生效时间的换乘网络（线路段 + 步行换乘边）按时间边界切片构图，校验枢纽可达性、双向换乘对称性、重复 / 自环边与重叠生效区间；通过的版本可用 `POST /network/snapshots` 固化并随时查询。票价争议通过 `POST /disputes` 提起（创建时冻结行程收费快照、申请额不得超过快照应收）、`POST /disputes/{id}/resolve` 凭乐观版本一次性结案并写入不可变退款流水；结案后若行程因事件更正而重算，`GET /disputes/{id}` 会实时报告待补退 / 待追回差额而不覆盖已结退款。此外提供 `POST /event-quality/scans` 刷卡事件质量扫描：在 UTC 半开区间内按 `(occurred_at, seq)` 扫描事件，识别窗口内重复同类刷卡与出站后未达到站点最短行程秒数便再次进站的时序冲突，结果只写入独立的只追加表，可随时用 `GET /event-quality/scans/{id}` 查询，绝不改动事件、行程、账单或审计。最后提供 `POST /privacy/exports` 匿名出行轨迹导出：在 UTC 半开区间（按进站时间）内读取行程，用服务器配置的 `PRIVACY_SALT` 对 `passenger_id` 做稳定 HMAC 假名化（同一乘客跨多段行程、跨多次导出保持同一假名），按（纪元对齐的 UTC 时间桶、起点站组、终点站组）统计去重乘客数，等价类人数不足最小群体 `k` 时**整组抑制**（不逐行泄露），只返回保留行程的假名 / 时间桶 / 站点组；结果只追加保存，相同 `export_id` 同载荷幂等、不同载荷 `409`，可用 `GET /privacy/exports/{id}` 查询。突发中断时可调用 `POST /disruption/replans` 疏运重排：提交最小换乘秒数、按站序排列（含 UTC 到发时刻与核定容量）的替代班次和必须整体成行的乘客组（origin / destination / ready_at / 人数），服务按 `(ready_at, group_id)` 依次在各相邻区段剩余容量约束下为每组选出**最早到达**行程（同到达再取换乘更少、班次 ID 序列字典序更小者），分配后逐段扣减容量，无法成行则给出滞留原因；班次时刻校验失败不落库，结果冻结保存，相同 `replan_id` 同载荷幂等、不同载荷 `409`，可用 `GET /disruption/replans/{id}` 查询。
 
 ## 启动
 
@@ -560,6 +560,111 @@ curl -X POST http://localhost:8000/privacy/exports \
 curl http://localhost:8000/privacy/exports/pex-2026-11-15-a
 ```
 
+### `POST /disruption/replans` — 突发中断疏运重排
+
+突发中断导致既有班次不可用时，调用方提交重排号 `replan_id`、**最小换乘秒数** `min_transfer_seconds`、一批**替代班次** `services` 与待疏运**乘客组** `groups`，服务一次性算出冻结的重排结果。
+
+- 每列替代班次 `services[i]`：`service_id`、核定容量 `capacity`（一个整数，表示该班次在**每个相邻区段**上可承载的人数）、以及**按站序排列**的停靠站 `stops`；每个停靠站含 `station_id`、到站 `arrival_at`、发时 `departure_at`（时间接受任意时区偏移并归一化为 UTC，同一站可到发同时刻）。
+- 每个乘客组 `groups[i]`：`group_id`、`origin`、`destination`、最早可出发时刻 `ready_at` 与 `party_size`。**每组必须整体搭乘**，不允许拆分。
+
+服务按 **`(ready_at, group_id)` 升序**逐组处理；每组在当前**各相邻区段剩余容量**约束下选出最优行程，行程择优规则依次为：
+
+1. **到达目的地最早**；
+2. 到达时刻相同，**换乘次数更少**（乘坐班次数 − 1）；
+3. 仍并列，**班次 ID 序列字典序更小**（逐段比较 `service_id`）。
+
+选出行程后按每组人数**逐段扣减**该行程经过的每个相邻区段容量，后续乘客组只能看到剩余座位。首班乘车只要求发时不早于 `ready_at`；在某站换乘另一班次时，后班发时距前班到站必须 **≥** `min_transfer_seconds`（恰好相等合法）。起点与终点相同的乘客组视为零站段成行（不消耗容量）。找不到可行行程时整组滞留，并按最先遇到的阻碍返回原因：
+
+- `origin_not_served`：没有任何替代班次停靠起点；
+- `destination_not_served`：没有任何替代班次停靠终点；
+- `unreachable_destination`：时刻网络中不存在从起点到终点的可行行程；
+- `insufficient_capacity`：忽略容量时可达，但考虑逐段剩余容量后没有任何行程能整体容纳该组。
+
+请求示例：
+
+```bash
+curl -X POST http://localhost:8000/disruption/replans \
+  -H "Content-Type: application/json" \
+  -d '{
+    "replan_id": "dr-2026-09-27-a",
+    "min_transfer_seconds": 300,
+    "services": [
+      {"service_id": "ALPHA", "capacity": 100, "stops": [
+        {"station_id": "A", "arrival_at": "2026-09-27T08:00:00Z",
+         "departure_at": "2026-09-27T08:05:00Z"},
+        {"station_id": "B", "arrival_at": "2026-09-27T08:20:00Z",
+         "departure_at": "2026-09-27T08:25:00Z"},
+        {"station_id": "E", "arrival_at": "2026-09-27T08:55:00Z",
+         "departure_at": "2026-09-27T08:55:00Z"}]},
+      {"service_id": "BRAVO", "capacity": 100, "stops": [
+        {"station_id": "B", "arrival_at": "2026-09-27T08:30:00Z",
+         "departure_at": "2026-09-27T08:30:00Z"},
+        {"station_id": "F", "arrival_at": "2026-09-27T09:00:00Z",
+         "departure_at": "2026-09-27T09:00:00Z"}]}
+    ],
+    "groups": [
+      {"group_id": "g1", "origin": "A", "destination": "F",
+       "ready_at": "2026-09-27T08:00:00Z", "party_size": 1},
+      {"group_id": "g2", "origin": "E", "destination": "A",
+       "ready_at": "2026-09-27T09:00:00Z", "party_size": 4}
+    ]
+  }'
+```
+
+响应（乘客组按处理顺序 `(ready_at, group_id)` 返回；`legs` 为零表示滞留或起终点相同）：
+
+```json
+{
+  "replan_id": "dr-2026-09-27-a",
+  "status": "created",
+  "min_transfer_seconds": 300,
+  "summary": {"group_count": 2, "assigned_count": 1, "stranded_count": 1},
+  "groups": [
+    {
+      "group_id": "g1",
+      "origin": "A",
+      "destination": "F",
+      "ready_at": "2026-09-27T08:00:00Z",
+      "party_size": 1,
+      "status": "assigned",
+      "arrival_at": "2026-09-27T09:00:00Z",
+      "transfers": 1,
+      "legs": [
+        {"service_id": "ALPHA", "from_station": "A", "to_station": "B",
+         "departure_at": "2026-09-27T08:05:00Z", "arrival_at": "2026-09-27T08:20:00Z"},
+        {"service_id": "BRAVO", "from_station": "B", "to_station": "F",
+         "departure_at": "2026-09-27T08:30:00Z", "arrival_at": "2026-09-27T09:00:00Z"}
+      ],
+      "stranded_reason": null
+    },
+    {
+      "group_id": "g2",
+      "origin": "E",
+      "destination": "A",
+      "ready_at": "2026-09-27T09:00:00Z",
+      "party_size": 4,
+      "status": "stranded",
+      "arrival_at": null,
+      "transfers": null,
+      "legs": [],
+      "stranded_reason": "unreachable_destination: no feasible itinerary reaches the destination from the origin"
+    }
+  ]
+}
+```
+
+- **时刻校验**：每列班次的停靠站必须唯一（同一站不得重复停靠）；同站 `departure_at >= arrival_at`，且每站到站必须**严格晚于**上一站发时（端点相接合法、到发倒挂非法）。`service_id` / `group_id` 重复、`min_transfer_seconds < 0`、`party_size < 1`、班次少于两个停靠站、`capacity < 0` 等均返回 `422`；**校验错误一律不写库**。
+- **幂等与冲突**：相同 `replan_id` + 相同载荷（班次 / 乘客组的数组顺序、时间偏移写法均不影响判定；班内站序是路线定义，始终保留）重复提交返回已固化结果（`status="duplicate"`，绝不重算、容量分配不变）；相同 `replan_id` + 不同载荷返回 `409`。
+- **冻结与隔离**：结果在创建时一次性固化到独立的只追加表 `disruption_replans`（存储层触发器禁止 `UPDATE` / `DELETE`）。重排只依据请求载荷计算，**不读取也不改动**事件、行程、账单、争议 / 退款，也**不追加审计记录**。
+
+### `GET /disruption/replans/{replan_id}` — 查询重排结果
+
+返回重排创建时固化的完整结果（`status` 固定为 `"created"`；重放标记只在 `POST` 响应中出现）。不存在返回 `404`。
+
+```bash
+curl http://localhost:8000/disruption/replans/dr-2026-09-27-a
+```
+
 ### `GET /config/fares` — 当前票价配置
 
 ## 业务审计链
@@ -571,7 +676,7 @@ curl http://localhost:8000/privacy/exports/pex-2026-11-15-a
 - 网络校验首次提交成功（无论是否通过）→ `network_validated`；网络快照固化成功 → `network_snapshot_created`；
 - 争议创建成功（冻结收费快照）→ `dispute_opened`；争议结案成功（写入不可变退款流水）→ `dispute_resolved`；
 - **重复请求不产生审计记录**：事件幂等重复（`duplicate`）、批次幂等重复（`duplicate`）、网络校验 / 快照幂等重复、争议 / 结案幂等重复（`duplicate`）、冲突（`409`）与校验失败（`422`）均不追加；
-- **只读分析不产生审计记录**：`POST /event-quality/scans` 只写其独立的只追加扫描表，`POST /privacy/exports` 只写其独立的只追加匿名导出表；两者都不触碰 `audit_log`，也不改动事件、行程、账单或争议数据；
+- **只读分析不产生审计记录**：`POST /event-quality/scans` 只写其独立的只追加扫描表，`POST /privacy/exports` 只写其独立的只追加匿名导出表，`POST /disruption/replans` 只写其独立的只追加重排表；三者都不触碰 `audit_log`，也不改动事件、行程、账单或争议数据；
 - 审计与业务数据同事务提交：业务写入（或审计写入）失败时一并回滚，不留半截记录。
 
 每条记录包含：全局序号 `seq`、操作类型 `operation`、UTC 时间 `occurred_at`、规范化请求摘要 `request_summary`（时间归一化、记录按流水号排序）、规范化结果摘要 `result_summary`、上一条哈希 `prev_hash` 与当前哈希 `record_hash`。哈希规则为对上述字段（含 `prev_hash`）做规范 JSON 后取 SHA-256；首条记录的 `prev_hash` 为空串。表上带有触发器，禁止任何 `UPDATE` / `DELETE`，记录只追加、不可修改。

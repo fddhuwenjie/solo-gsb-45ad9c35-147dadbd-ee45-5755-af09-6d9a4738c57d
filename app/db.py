@@ -312,6 +312,37 @@ BEGIN
     SELECT RAISE(ABORT, 'privacy_export_trips is append-only: DELETE is not allowed');
 END;
 
+-- Sudden-disruption evacuation replans. Like the quality scans and privacy
+-- exports these tables are deliberately isolated: a replan computes purely
+-- from the request payload and appends its own frozen result. Events, trips,
+-- charges, disputes and the audit_log are never touched, and replan writes do
+-- not append audit records. A replan_id maps to at most one request; the
+-- canonical payload hash enforces idempotency (same payload replays the stored
+-- result, different payload -> 409).
+CREATE TABLE IF NOT EXISTS disruption_replans (
+    replan_id              TEXT PRIMARY KEY,
+    payload_hash           TEXT NOT NULL,     -- sha256 of the canonical request
+    payload                TEXT NOT NULL,     -- canonical JSON of the normalised request
+    min_transfer_seconds   INTEGER NOT NULL,
+    group_count            INTEGER NOT NULL,
+    assigned_count         INTEGER NOT NULL,
+    stranded_count         INTEGER NOT NULL,
+    result                 TEXT NOT NULL,     -- JSON: the exact API response
+    created_at             TEXT NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_disruption_replans_no_update
+BEFORE UPDATE ON disruption_replans
+BEGIN
+    SELECT RAISE(ABORT, 'disruption_replans is append-only: UPDATE is not allowed');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_disruption_replans_no_delete
+BEFORE DELETE ON disruption_replans
+BEGIN
+    SELECT RAISE(ABORT, 'disruption_replans is append-only: DELETE is not allowed');
+END;
+
 -- Append-only, hash-chained business audit log. One global sequence spans all
 -- operation types; record_n hashes seq | operation | timestamp | canonical
 -- request/result summaries | record_{n-1}'s hash. Rows are only ever inserted

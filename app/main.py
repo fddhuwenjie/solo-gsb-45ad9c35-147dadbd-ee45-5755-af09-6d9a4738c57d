@@ -23,6 +23,12 @@ from .disputes import (
     payload_hash,
     refund_id_for,
 )
+from .disruption import (
+    build_replan,
+    canonical_replan_payload,
+    normalise_input,
+    payload_hash as replan_payload_hash,
+)
 from .event_quality import (
     canonical_scan_payload,
     load_window_events,
@@ -38,6 +44,8 @@ from .models import (
     DisputeIn,
     DisputeOut,
     DisputeResolveIn,
+    DisruptionReplanIn,
+    DisruptionReplanOut,
     EventQualityScanIn,
     EventQualityScanOut,
     EventResult,
@@ -106,7 +114,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Transit Fare Settlement API",
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -1325,6 +1333,101 @@ def get_privacy_export(
     with db.lock():
         row, trip_rows = _load_export(db, export_id)
     return _export_response(row, trip_rows, "created")
+
+
+# ---------------------------------------------------------------------------
+# Sudden-disruption evacuation replanning (read-only analysis, isolated
+# append-only tables; no audit records)
+# ---------------------------------------------------------------------------
+
+
+def _replan_response(row, status: str) -> DisruptionReplanOut:
+    stored = json.loads(row["result"])
+    stored["status"] = status  # the stored body always carries "created"
+    return DisruptionReplanOut(**stored)
+
+
+@app.post("/disruption/replans", response_model=DisruptionReplanOut, status_code=200)
+def create_disruption_replan(
+    body: DisruptionReplanIn,
+    db: Database = Depends(get_db),
+) -> DisruptionReplanOut:
+    # Structural timetable checks are rejected before any persistence:
+    # duplicate service/group ids, repeated stops inside one service, and
+    # non-monotonic arrival/departure times never leave a row behind.
+    try:
+        min_transfer_seconds, services, groups = normalise_input(body)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    canonical_payload = canonical_replan_payload(
+        body.replan_id, min_transfer_seconds, services, groups
+    )
+    p_hash = replan_payload_hash(canonical_payload)
+
+    with db.lock(), db.conn:
+        existing = db.conn.execute(
+            "SELECT * FROM disruption_replans WHERE replan_id = ?",
+            (body.replan_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["payload_hash"] != p_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"replan_id '{body.replan_id}' already exists with a"
+                        " different payload"
+                    ),
+                )
+            # Idempotent replay: the frozen allocation is never recomputed.
+            return _replan_response(existing, "duplicate")
+
+        result = build_replan(min_transfer_seconds, services, groups)
+        created_at = iso_str(datetime.now(timezone.utc))
+        db.conn.execute(
+            "INSERT INTO disruption_replans (replan_id, payload_hash, payload,"
+            " min_transfer_seconds, group_count, assigned_count,"
+            " stranded_count, result, created_at)"
+            " VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                body.replan_id,
+                p_hash,
+                canonical_json(canonical_payload),
+                min_transfer_seconds,
+                result["summary"]["group_count"],
+                result["summary"]["assigned_count"],
+                result["summary"]["stranded_count"],
+                canonical_json(
+                    {"replan_id": body.replan_id, "status": "created", **result}
+                ),
+                created_at,
+            ),
+        )
+        # Replans are read-only analysis computed solely from the request:
+        # no business table is touched and no audit record is appended.
+        row = db.conn.execute(
+            "SELECT * FROM disruption_replans WHERE replan_id = ?",
+            (body.replan_id,),
+        ).fetchone()
+
+    return _replan_response(row, "created")
+
+
+@app.get("/disruption/replans/{replan_id}", response_model=DisruptionReplanOut)
+def get_disruption_replan(
+    replan_id: str,
+    db: Database = Depends(get_db),
+) -> DisruptionReplanOut:
+    with db.lock():
+        row = db.conn.execute(
+            "SELECT * FROM disruption_replans WHERE replan_id = ?",
+            (replan_id,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"disruption replan '{replan_id}' not found"
+        )
+    return _replan_response(row, "created")
 
 
 @app.get("/audit", response_model=AuditList)
