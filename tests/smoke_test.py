@@ -16,6 +16,13 @@ the anonymous trajectory export endpoints (epoch-anchored UTC time buckets,
 station groups, stable HMAC pseudonyms, distinct-passenger k-anonymity with
 whole-class suppression, half-open trip window, idempotency/409 conflict,
 GET query, isolated append-only tables with no business or audit side effects),
+the disruption replan endpoints (ordered replacement services with UTC
+arrival/departure times and rated segment capacity, indivisible passenger
+groups processed by (ready_at, group_id), earliest-arrival journey under
+remaining per-segment capacity with fewer-transfer / lexicographic tie-breaks,
+segment-by-segment deduction, stranding reasons, structural 422 validation that
+never persists, idempotency/409 conflict, frozen GET query, isolated
+append-only tables with no business or audit side effects),
 the append-only hash-chained business audit log (idempotency, verification,
 tamper detection, append-only triggers, atomic rollback),
 and the online GET /admin/backup endpoint (SQLite backup API, live writes keep
@@ -1221,6 +1228,288 @@ def run(client):
                 blocked_exports.append(stmt)
         check("privacy export tables are append-only at the storage layer",
               len(blocked_exports) == 4)
+
+    # --- Disruption service replanning --------------------------------------
+    # Replacement network on 2026-12-01:
+    #   svc-A: H 08:00 -> X 08:30 (dep 08:40) -> W 09:00   cap 30
+    #   svc-B: X 08:50 -> Y 09:20                          cap 50
+    #   svc-C: X 09:30 -> Z 10:00                          cap 50
+    #   svc-D: H 07:30 -> Y 09:05 (direct)                 cap 50
+    #   svc-E: P 08:00 -> Q 08:30 (disconnected island)    cap 50
+    # Min transfer 600s: A->X at 08:30 can take B at 08:40
+    # (exactly 600s) but not C at 08:50 needs... (C dep 09:30 is fine too;
+    # the boundary probe below tightens it).
+    replan_services = [
+        {"service_id": "svc-A", "capacity": 30, "stops": [
+            {"station": "H", "arrival_at": None, "departure_at": "2026-12-01T08:00:00Z"},
+            {"station": "X", "arrival_at": "2026-12-01T08:30:00Z",
+             "departure_at": "2026-12-01T08:40:00Z"},
+            {"station": "W", "arrival_at": "2026-12-01T09:00:00Z", "departure_at": None}]},
+        {"service_id": "svc-B", "capacity": 50, "stops": [
+            {"station": "X", "arrival_at": "2026-12-01T08:45:00Z",
+             "departure_at": "2026-12-01T08:50:00Z"},
+            {"station": "Y", "arrival_at": "2026-12-01T09:20:00Z", "departure_at": None}]},
+        {"service_id": "svc-C", "capacity": 50, "stops": [
+            {"station": "X", "arrival_at": "2026-12-01T09:25:00Z",
+             "departure_at": "2026-12-01T09:30:00Z"},
+            {"station": "Z", "arrival_at": "2026-12-01T10:00:00Z", "departure_at": None}]},
+        {"service_id": "svc-D", "capacity": 50, "stops": [
+            {"station": "H", "arrival_at": None, "departure_at": "2026-12-01T07:30:00Z"},
+            {"station": "Y", "arrival_at": "2026-12-01T09:05:00Z", "departure_at": None}]},
+        {"service_id": "svc-E", "capacity": 50, "stops": [
+            {"station": "P", "arrival_at": None, "departure_at": "2026-12-01T08:00:00Z"},
+            {"station": "Q", "arrival_at": "2026-12-01T08:30:00Z", "departure_at": None}]},
+    ]
+    replan_body = {
+        "replan_id": "dr-2026-12-01-a",
+        "min_transfer_seconds": 600,
+        "services": replan_services,
+        "groups": [
+            # g1 earliest: direct D at 09:05 beats A+B at 09:20.
+            {"group_id": "g1", "origin": "H", "destination": "Y",
+             "ready_at": "2026-12-01T07:00:00Z", "party_size": 10},
+            # g2 takes A H->X->W whole ride.
+            {"group_id": "g2", "origin": "H", "destination": "W",
+             "ready_at": "2026-12-01T07:00:00Z", "party_size": 20},
+            # g3: A H->X only 10 seats left after g2 -> cannot ride as a
+            # whole, and D does not stop at Z: insufficient capacity.
+            {"group_id": "g3", "origin": "H", "destination": "Z",
+             "ready_at": "2026-12-01T07:00:00Z", "party_size": 15},
+            # g4/g5: stations nobody serves.
+            {"group_id": "g4", "origin": "ZZ", "destination": "Y",
+             "ready_at": "2026-12-01T07:00:00Z", "party_size": 1},
+            {"group_id": "g5", "origin": "H", "destination": "ZZ",
+             "ready_at": "2026-12-01T07:00:00Z", "party_size": 1},
+            # g6: W is served but nothing returns from W to H.
+            {"group_id": "g6", "origin": "W", "destination": "H",
+             "ready_at": "2026-12-01T07:00:00Z", "party_size": 1},
+            # g7: ready at 09:30, every H departure is gone.
+            {"group_id": "g7", "origin": "H", "destination": "Y",
+             "ready_at": "2026-12-01T09:30:00Z", "party_size": 1},
+            # g8: Q->P along the disconnected island.
+            {"group_id": "g8", "origin": "Q", "destination": "P",
+             "ready_at": "2026-12-01T07:00:00Z", "party_size": 1},
+            # g9: X->Z via svc-C, direct single service.
+            {"group_id": "g9", "origin": "X", "destination": "Z",
+             "ready_at": "2026-12-01T08:00:00Z", "party_size": 5},
+        ],
+    }
+
+    audit_before_replans = client.get("/audit", params={"limit": 1000}).json()["count"]
+    r = client.post("/disruption/replans", json=replan_body)
+    check("replan created", r.status_code == 200, r.text)
+    rp = r.json()
+    check("replan status created", rp["status"] == "created")
+    by_group = {a["group_id"]: a for a in rp["assignments"]}
+    check("assignments ordered by (ready_at, group_id)",
+          [a["group_id"] for a in rp["assignments"]]
+          == ["g1", "g2", "g3", "g4", "g5", "g6", "g8", "g9", "g7"],
+          [a["group_id"] for a in rp["assignments"]])
+    check("g1 takes the earliest direct service",
+          by_group["g1"]["status"] == "assigned"
+          and by_group["g1"]["services"] == ["svc-D"]
+          and by_group["g1"]["arrived_at"] == "2026-12-01T09:05:00Z"
+          and by_group["g1"]["transfers"] == 0)
+    check("g1 itinerary leg details",
+          by_group["g1"]["itinerary"] == [
+              {"service_id": "svc-D", "board_station": "H", "alight_station": "Y",
+               "board_at": "2026-12-01T07:30:00Z",
+               "alight_at": "2026-12-01T09:05:00Z"}])
+    check("g2 rides A all the way to W",
+          by_group["g2"]["status"] == "assigned"
+          and by_group["g2"]["services"] == ["svc-A"]
+          and by_group["g2"]["arrived_at"] == "2026-12-01T09:00:00Z"
+          and by_group["g2"]["transfers"] == 0)
+    check("g3 stranded by capacity on the only transfer path",
+          by_group["g3"]["status"] == "stranded"
+          and by_group["g3"]["stranding"]["code"] == "insufficient_capacity")
+    check("g4 origin not served",
+          by_group["g4"]["stranding"]["code"] == "origin_not_served")
+    check("g5 destination not served",
+          by_group["g5"]["stranding"]["code"] == "destination_not_served")
+    check("g6 no feasible connection back",
+          by_group["g6"]["stranding"]["code"] == "no_feasible_connection")
+    check("g7 no departure after ready",
+          by_group["g7"]["stranding"]["code"] == "no_departure_after_ready")
+    check("g8 island has no reverse service",
+          by_group["g8"]["stranding"]["code"] == "no_feasible_connection")
+    check("g9 assigned X->Z on svc-C",
+          by_group["g9"]["status"] == "assigned"
+          and by_group["g9"]["services"] == ["svc-C"]
+          and by_group["g9"]["arrived_at"] == "2026-12-01T10:00:00Z")
+    check("replan summary counts",
+          rp["summary"] == {
+              "group_count": 9, "assigned_count": 3, "stranded_count": 6,
+              "total_passengers": 55, "assigned_passengers": 35,
+              "stranded_passengers": 20})
+
+    # Capacity view: svc-A H->X carries g1? No -- g1 took svc-D; svc-A
+    # H->X carries only g2 (20); X->W carries g2 (20). svc-D carries g1 (10).
+    cap_by_service = {s["service_id"]: s["segment_capacities"]
+                      for s in rp["services"]}
+    check("svc-A remaining after g2",
+          [(c["remaining"], c["capacity"]) for c in cap_by_service["svc-A"]]
+          == [(10, 30), (10, 30)])
+    check("svc-C remaining after g9",
+          [(c["remaining"], c["capacity"]) for c in cap_by_service["svc-C"]]
+          == [(45, 50)])
+    check("untouched svc-B keeps full capacity",
+          [(c["remaining"], c["capacity"]) for c in cap_by_service["svc-B"]]
+          == [(50, 50)])
+
+    # Transfer tie-break: with the direct svc-D removed, H->Y at 09:20 is the
+    # earliest via A+B with exactly the 600s minimum transfer (08:30 -> 08:40).
+    transfer_body = {
+        "replan_id": "dr-transfer-boundary",
+        "min_transfer_seconds": 600,
+        "services": [
+            {"service_id": "svc-A", "capacity": 50, "stops": [
+                {"station": "H", "arrival_at": None,
+                 "departure_at": "2026-12-01T08:00:00Z"},
+                {"station": "X", "arrival_at": "2026-12-01T08:30:00Z",
+                 "departure_at": "2026-12-01T08:32:00Z"}]},
+            {"service_id": "svc-B", "capacity": 50, "stops": [
+                {"station": "X", "arrival_at": "2026-12-01T08:35:00Z",
+                 "departure_at": "2026-12-01T08:40:00Z"},
+                {"station": "Y", "arrival_at": "2026-12-01T09:20:00Z",
+                 "departure_at": None}]}],
+        "groups": [
+            {"group_id": "g1", "origin": "H", "destination": "Y",
+             "ready_at": "2026-12-01T07:00:00Z", "party_size": 1}],
+    }
+    r = client.post("/disruption/replans", json=transfer_body)
+    check("exactly minimum transfer seconds makes the connection",
+          r.status_code == 200
+          and r.json()["assignments"][0]["services"] == ["svc-A", "svc-B"]
+          and r.json()["assignments"][0]["transfers"] == 1,
+          r.text)
+    tight = dict(transfer_body, replan_id="dr-transfer-tight",
+                 min_transfer_seconds=601)
+    r = client.post("/disruption/replans", json=tight)
+    check("one second short of the minimum strands the group",
+          r.status_code == 200
+          and r.json()["assignments"][0]["status"] == "stranded"
+          and r.json()["assignments"][0]["stranding"]["code"]
+          == "no_feasible_connection", r.text)
+
+    # Lexicographic tie-break on the service id sequence at equal arrival and
+    # equal number of transfers.
+    lex_body = {
+        "replan_id": "dr-lex", "min_transfer_seconds": 0,
+        "services": [
+            {"service_id": "svc-Z", "capacity": 50, "stops": [
+                {"station": "H", "arrival_at": None,
+                 "departure_at": "2026-12-01T07:30:00Z"},
+                {"station": "Y", "arrival_at": "2026-12-01T09:00:00Z",
+                 "departure_at": None}]},
+            {"service_id": "svc-A", "capacity": 50, "stops": [
+                {"station": "H", "arrival_at": None,
+                 "departure_at": "2026-12-01T07:30:00Z"},
+                {"station": "Y", "arrival_at": "2026-12-01T09:00:00Z",
+                 "departure_at": None}]}],
+        "groups": [
+            {"group_id": "g1", "origin": "H", "destination": "Y",
+             "ready_at": "2026-12-01T07:00:00Z", "party_size": 1}],
+    }
+    r = client.post("/disruption/replans", json=lex_body)
+    check("equal arrival picks lexicographically smaller service id",
+          r.json()["assignments"][0]["services"] == ["svc-A"], r.text)
+
+    # Idempotency: same id + same payload (shuffled array order, offset
+    # notation) replays the frozen result; a different payload -> 409.
+    shuffled_replan = dict(
+        replan_body,
+        services=list(reversed(replan_body["services"])),
+        groups=list(reversed(replan_body["groups"])),
+    )
+    # Rewrite one timestamp in +00:00 offset notation; payload stays equal.
+    shuffled_replan["groups"][-1]["ready_at"] = "2026-12-01T07:00:00+00:00"
+    r = client.post("/disruption/replans", json=shuffled_replan)
+    check("replan replay is idempotent",
+          r.status_code == 200 and r.json()["status"] == "duplicate"
+          and r.json()["assignments"] == rp["assignments"]
+          and r.json()["summary"] == rp["summary"], r.text)
+    conflict_replan = dict(replan_body, min_transfer_seconds=601)
+    r = client.post("/disruption/replans", json=conflict_replan)
+    check("same replan id with different payload -> 409", r.status_code == 409)
+    check("409 does not change the frozen replan",
+          client.post("/disruption/replans", json=replan_body).json()["status"]
+          == "duplicate")
+
+    # GET freezes the same artefact; missing id -> 404.
+    r = client.get("/disruption/replans/dr-2026-12-01-a")
+    check("GET replan returns the frozen result",
+          r.status_code == 200 and r.json()["status"] == "created"
+          and r.json()["assignments"] == rp["assignments"]
+          and r.json()["created_at"] == rp["created_at"])
+    check("GET missing replan -> 404",
+          client.get("/disruption/replans/no-such-replan").status_code == 404)
+
+    # Structural validation: 422 and nothing is persisted.
+    def invalid_replan(name, mutate):
+        bad = json.loads(json.dumps(replan_body))
+        bad["replan_id"] = f"dr-invalid-{name}"
+        mutate(bad)
+        rr = client.post("/disruption/replans", json=bad)
+        check(f"invalid replan '{name}' -> 422", rr.status_code == 422, rr.text)
+        check(f"invalid replan '{name}' not persisted",
+              client.get(f"/disruption/replans/dr-invalid-{name}").status_code
+              == 404)
+
+    def dup_service(bad):
+        bad["services"].append(dict(bad["services"][0]))
+    def dup_station(bad):
+        bad["services"][0]["stops"].append(dict(bad["services"][0]["stops"][0]))
+    def backwards(bad):
+        bad["services"][0]["stops"][1]["arrival_at"] = "2026-12-01T07:00:00Z"
+    def dep_before_arr(bad):
+        bad["services"][0]["stops"][1]["departure_at"] = "2026-12-01T08:20:00Z"
+    def first_no_dep(bad):
+        bad["services"][0]["stops"][0]["departure_at"] = None
+    def last_no_arr(bad):
+        bad["services"][0]["stops"][-1]["arrival_at"] = None
+    def dup_group(bad):
+        bad["groups"].append(dict(bad["groups"][0]))
+    def same_od(bad):
+        bad["groups"][0]["destination"] = bad["groups"][0]["origin"]
+    def zero_party(bad):
+        bad["groups"][0]["party_size"] = 0
+    def negative_transfer(bad):
+        bad["min_transfer_seconds"] = -1
+
+    invalid_replan("dup-service", dup_service)
+    invalid_replan("dup-station", dup_station)
+    invalid_replan("backwards", backwards)
+    invalid_replan("dep-before-arr", dep_before_arr)
+    invalid_replan("first-no-departure", first_no_dep)
+    invalid_replan("last-no-arrival", last_no_arr)
+    invalid_replan("dup-group", dup_group)
+    invalid_replan("same-origin-destination", same_od)
+    invalid_replan("zero-party", zero_party)
+    invalid_replan("negative-transfer", negative_transfer)
+
+    # Isolation: replans touch only their own append-only table and never the
+    # audit log or any business table.
+    check("replans create no audit records",
+          client.get("/audit", params={"limit": 1000}).json()["count"]
+          == audit_before_replans)
+    with sqlite3.connect(os.environ["DB_PATH"]) as raw:
+        n_replans = raw.execute(
+            "SELECT COUNT(*) FROM disruption_replans"
+        ).fetchone()[0]
+        # Main + boundary + tight + lex = 4 created; replays/409/422 add none.
+        check("only valid replans persisted", n_replans == 4)
+        blocked_replans = []
+        for stmt in (
+            "UPDATE disruption_replans SET assigned_count = 0 WHERE replan_id = 'dr-2026-12-01-a'",
+            "DELETE FROM disruption_replans WHERE replan_id = 'dr-2026-12-01-a'",
+        ):
+            try:
+                raw.execute(stmt)
+            except sqlite3.Error:
+                blocked_replans.append(stmt)
+        check("disruption replans table is append-only at the storage layer",
+              len(blocked_replans) == 2)
 
     # --- Business audit chain ----------------------------------------------------
     # Fetch the whole chain in one page: the default page size is 100 and this

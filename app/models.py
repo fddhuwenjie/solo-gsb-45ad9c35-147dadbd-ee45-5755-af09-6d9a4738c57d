@@ -438,3 +438,99 @@ class PrivacyExportOut(BaseModel):
     suppressed_trip_count: int
     classes: list[PrivacyEquivalenceClass]
     trips: list[PrivacyExportTrip]
+
+
+# ---------------------------------------------------------------------------
+# Disruption service replanning
+# ---------------------------------------------------------------------------
+
+
+class ReplanServiceStopIn(BaseModel):
+    station: str = Field(min_length=1, max_length=64)
+    arrival_at: datetime | None = None    # None only at the first stop
+    departure_at: datetime | None = None  # None only at the last stop
+
+
+class ReplanServiceIn(BaseModel):
+    service_id: str = Field(min_length=1, max_length=64)
+    stops: list[ReplanServiceStopIn] = Field(min_length=2)
+    capacity: int = Field(ge=1, description="Rated capacity on every adjacent segment")
+
+
+class ReplanGroupIn(BaseModel):
+    group_id: str = Field(min_length=1, max_length=64)
+    origin: str = Field(min_length=1, max_length=64)
+    destination: str = Field(min_length=1, max_length=64)
+    ready_at: datetime  # earliest UTC time the whole group can board
+    party_size: int = Field(ge=1)  # the group is indivisible and rides together
+
+
+class ReplanIn(BaseModel):
+    replan_id: str = Field(min_length=1, max_length=128)
+    min_transfer_seconds: int = Field(ge=0)
+    services: list[ReplanServiceIn] = Field(min_length=1)
+    groups: list[ReplanGroupIn] = Field(min_length=1)
+
+
+class ReplanLeg(BaseModel):
+    service_id: str
+    board_station: str
+    alight_station: str
+    board_at: str
+    alight_at: str
+
+
+class ReplanStranding(BaseModel):
+    code: Literal[
+        "origin_not_served",
+        "destination_not_served",
+        "no_departure_after_ready",
+        "no_feasible_connection",
+        "insufficient_capacity",
+    ]
+    message: str
+
+
+class ReplanAssignment(BaseModel):
+    group_id: str
+    origin: str
+    destination: str
+    ready_at: str
+    party_size: int
+    status: Literal["assigned", "stranded"]
+    arrived_at: str | None
+    transfers: int          # number of inter-service changes along the itinerary
+    services: list[str]     # ordered service id sequence
+    itinerary: list[ReplanLeg]
+    stranding: ReplanStranding | None
+
+
+class ReplanSegmentCapacity(BaseModel):
+    from_station: str
+    to_station: str
+    capacity: int           # rated capacity
+    remaining: int          # seats left after every assigned group was deducted
+
+
+class ReplanServiceCapacity(BaseModel):
+    service_id: str
+    segment_capacities: list[ReplanSegmentCapacity]
+
+
+class ReplanSummary(BaseModel):
+    group_count: int
+    assigned_count: int
+    stranded_count: int
+    total_passengers: int
+    assigned_passengers: int
+    stranded_passengers: int
+
+
+class ReplanOut(BaseModel):
+    replan_id: str
+    status: Literal["created", "duplicate"]
+    min_transfer_seconds: int
+    created_at: str
+    summary: ReplanSummary
+    services: list[ReplanServiceCapacity]
+    assignments: list[ReplanAssignment]

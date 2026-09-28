@@ -16,6 +16,13 @@ from starlette.responses import FileResponse
 from .audit import append_audit, canonical_json, verify_chain
 from .config import FareConfig, load_config
 from .db import Database
+from .disruption import (
+    ValidationError as ReplanValidationError,
+    canonical_replan_payload,
+    payload_hash as replan_payload_hash,
+    plan_replan,
+    validate_and_parse,
+)
 from .disputes import (
     canonical_dispute_payload,
     canonical_resolve_payload,
@@ -57,6 +64,13 @@ from .models import (
     ReconBatchOut,
     ReconResultItem,
     ReconSummary,
+    ReplanAssignment,
+    ReplanIn,
+    ReplanLeg,
+    ReplanOut,
+    ReplanServiceCapacity,
+    ReplanStranding,
+    ReplanSummary,
     TapEventIn,
     TripOut,
 )
@@ -106,7 +120,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Transit Fare Settlement API",
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -1325,6 +1339,131 @@ def get_privacy_export(
     with db.lock():
         row, trip_rows = _load_export(db, export_id)
     return _export_response(row, trip_rows, "created")
+
+
+# ---------------------------------------------------------------------------
+# Disruption service replanning (isolated append-only tables; no audit records)
+# ---------------------------------------------------------------------------
+
+
+def _replan_response(row, status: str) -> ReplanOut:
+    stored = json.loads(row["result"])
+    stored["status"] = status  # the stored body always carries "created"
+    return ReplanOut(**stored)
+
+
+@app.post("/disruption/replans", response_model=ReplanOut, status_code=200)
+def create_disruption_replan(
+    body: ReplanIn,
+    db: Database = Depends(get_db),
+) -> ReplanOut:
+    # Structural validation before touching the database: an invalid request
+    # (duplicate ids, repeated stations, non-monotonic timestamps, ...) is
+    # rejected with 422 and never lands in storage.
+    try:
+        services, groups = validate_and_parse(body)
+    except ReplanValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    canonical_payload = canonical_replan_payload(body, services, groups)
+    p_hash = replan_payload_hash(canonical_payload)
+
+    with db.lock(), db.conn:
+        existing = db.conn.execute(
+            "SELECT * FROM disruption_replans WHERE replan_id = ?",
+            (body.replan_id,),
+        ).fetchone()
+        if existing is not None:
+            if existing["payload_hash"] != p_hash:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        f"replan_id '{body.replan_id}' already exists with a"
+                        " different payload"
+                    ),
+                )
+            # Idempotent replay: the frozen assignments are never recomputed.
+            return _replan_response(existing, "duplicate")
+
+        result = plan_replan(services, groups, body.min_transfer_seconds)
+        created_at = iso_str(datetime.now(timezone.utc))
+        response = ReplanOut(
+            replan_id=body.replan_id,
+            status="created",
+            min_transfer_seconds=body.min_transfer_seconds,
+            created_at=created_at,
+            summary=ReplanSummary(**result["summary"]),
+            services=[
+                ReplanServiceCapacity(**svc) for svc in result["services"]
+            ],
+            assignments=[
+                ReplanAssignment(
+                    group_id=a["group_id"],
+                    origin=a["origin"],
+                    destination=a["destination"],
+                    ready_at=a["ready_at"],
+                    party_size=a["party_size"],
+                    status=a["status"],
+                    arrived_at=a["arrived_at"],
+                    transfers=a["transfers"],
+                    services=a["services"],
+                    itinerary=[ReplanLeg(**leg) for leg in a["itinerary"]],
+                    stranding=(
+                        ReplanStranding(**a["stranding"])
+                        if a["stranding"] is not None
+                        else None
+                    ),
+                )
+                for a in result["assignments"]
+            ],
+        )
+
+        summary = result["summary"]
+        db.conn.execute(
+            "INSERT INTO disruption_replans (replan_id, payload_hash, payload,"
+            " min_transfer_seconds, group_count, assigned_count, stranded_count,"
+            " total_passengers, assigned_passengers, stranded_passengers,"
+            " result, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                body.replan_id,
+                p_hash,
+                canonical_json(canonical_payload),
+                body.min_transfer_seconds,
+                summary["group_count"],
+                summary["assigned_count"],
+                summary["stranded_count"],
+                summary["total_passengers"],
+                summary["assigned_passengers"],
+                summary["stranded_passengers"],
+                canonical_json(response.model_dump()),
+                created_at,
+            ),
+        )
+        # Replans are isolated read-mostly analysis over the request body:
+        # events/trips/charges/disputes and the audit_log are never touched.
+        row = db.conn.execute(
+            "SELECT * FROM disruption_replans WHERE replan_id = ?",
+            (body.replan_id,),
+        ).fetchone()
+
+    return _replan_response(row, "created")
+
+
+@app.get("/disruption/replans/{replan_id}", response_model=ReplanOut)
+def get_disruption_replan(
+    replan_id: str,
+    db: Database = Depends(get_db),
+) -> ReplanOut:
+    with db.lock():
+        row = db.conn.execute(
+            "SELECT * FROM disruption_replans WHERE replan_id = ?",
+            (replan_id,),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(
+            status_code=404, detail=f"replan '{replan_id}' not found"
+        )
+    return _replan_response(row, "created")
 
 
 @app.get("/audit", response_model=AuditList)

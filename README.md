@@ -1,6 +1,6 @@
 # 公共交通票价结算 API
 
-基于 FastAPI + SQLite 的公交/地铁票价结算与换乘网络校验服务。客户端提交刷卡事件，服务按事件时间配对行程，依据可配置的分区票价、换乘优惠以及 UTC 自然日 / 自然周（ISO 周，周一起算）封顶规则计算应收金额；迟到或更正的记录会触发受影响乘客全量重算并返回每段行程的计费依据与调账差额。此外提供 `POST /reconciliations` 扣款对账接口，按出站时间快照内部行程费用，与外部扣款明细进行批次化一对一核对。`POST /network/validate` 还可对带生效时间的换乘网络（线路段 + 步行换乘边）按时间边界切片构图，校验枢纽可达性、双向换乘对称性、重复 / 自环边与重叠生效区间；通过的版本可用 `POST /network/snapshots` 固化并随时查询。票价争议通过 `POST /disputes` 提起（创建时冻结行程收费快照、申请额不得超过快照应收）、`POST /disputes/{id}/resolve` 凭乐观版本一次性结案并写入不可变退款流水；结案后若行程因事件更正而重算，`GET /disputes/{id}` 会实时报告待补退 / 待追回差额而不覆盖已结退款。此外提供 `POST /event-quality/scans` 刷卡事件质量扫描：在 UTC 半开区间内按 `(occurred_at, seq)` 扫描事件，识别窗口内重复同类刷卡与出站后未达到站点最短行程秒数便再次进站的时序冲突，结果只写入独立的只追加表，可随时用 `GET /event-quality/scans/{id}` 查询，绝不改动事件、行程、账单或审计。最后提供 `POST /privacy/exports` 匿名出行轨迹导出：在 UTC 半开区间（按进站时间）内读取行程，用服务器配置的 `PRIVACY_SALT` 对 `passenger_id` 做稳定 HMAC 假名化（同一乘客跨多段行程、跨多次导出保持同一假名），按（纪元对齐的 UTC 时间桶、起点站组、终点站组）统计去重乘客数，等价类人数不足最小群体 `k` 时**整组抑制**（不逐行泄露），只返回保留行程的假名 / 时间桶 / 站点组；结果只追加保存，相同 `export_id` 同载荷幂等、不同载荷 `409`，可用 `GET /privacy/exports/{id}` 查询。
+基于 FastAPI + SQLite 的公交/地铁票价结算与换乘网络校验服务。客户端提交刷卡事件，服务按事件时间配对行程，依据可配置的分区票价、换乘优惠以及 UTC 自然日 / 自然周（ISO 周，周一起算）封顶规则计算应收金额；迟到或更正的记录会触发受影响乘客全量重算并返回每段行程的计费依据与调账差额。此外提供 `POST /reconciliations` 扣款对账接口，按出站时间快照内部行程费用，与外部扣款明细进行批次化一对一核对。`POST /network/validate` 还可对带生效时间的换乘网络（线路段 + 步行换乘边）按时间边界切片构图，校验枢纽可达性、双向换乘对称性、重复 / 自环边与重叠生效区间；通过的版本可用 `POST /network/snapshots` 固化并随时查询。票价争议通过 `POST /disputes` 提起（创建时冻结行程收费快照、申请额不得超过快照应收）、`POST /disputes/{id}/resolve` 凭乐观版本一次性结案并写入不可变退款流水；结案后若行程因事件更正而重算，`GET /disputes/{id}` 会实时报告待补退 / 待追回差额而不覆盖已结退款。此外提供 `POST /event-quality/scans` 刷卡事件质量扫描：在 UTC 半开区间内按 `(occurred_at, seq)` 扫描事件，识别窗口内重复同类刷卡与出站后未达到站点最短行程秒数便再次进站的时序冲突，结果只写入独立的只追加表，可随时用 `GET /event-quality/scans/{id}` 查询，绝不改动事件、行程、账单或审计。最后提供 `POST /privacy/exports` 匿名出行轨迹导出：在 UTC 半开区间（按进站时间）内读取行程，用服务器配置的 `PRIVACY_SALT` 对 `passenger_id` 做稳定 HMAC 假名化（同一乘客跨多段行程、跨多次导出保持同一假名），按（纪元对齐的 UTC 时间桶、起点站组、终点站组）统计去重乘客数，等价类人数不足最小群体 `k` 时**整组抑制**（不逐行泄露），只返回保留行程的假名 / 时间桶 / 站点组；结果只追加保存，相同 `export_id` 同载荷幂等、不同载荷 `409`，可用 `GET /privacy/exports/{id}` 查询。突发中断期间则使用 `POST /disruption/replans` 疏运重排：提交重排号、最小换乘秒数、按站序排列且含 UTC 到发时刻与核定容量的替代班次，以及含 `origin`、`destination`、`ready_at`、人数的乘客组；乘客组按 `(ready_at, group_id)` 顺序处理、必须整体搭乘，在各相邻区段剩余容量约束下选择最早到达行程（同到达依次取换乘更少、班次 ID 序列字典序更小者），逐段扣减容量，无法成行的乘客组返回具体滞留原因；结果冻结保存，相同 `replan_id` 同载荷幂等、异载荷 `409`，可用 `GET /disruption/replans/{id}` 查询。
 
 ## 启动
 
@@ -560,6 +560,128 @@ curl -X POST http://localhost:8000/privacy/exports \
 curl http://localhost:8000/privacy/exports/pex-2026-11-15-a
 ```
 
+### `POST /disruption/replans` — 突发中断疏运重排
+
+线路突发中断后，调度方提交**替代班次**与受影响的**乘客组**，服务一次性算出每组的最优疏运行程并冻结结果。请求包含：
+
+- `replan_id`：重排号；
+- `min_transfer_seconds`：最小换乘秒数，接续班次的发车时刻与到达时刻之差必须 **≥** 该值（恰好取等合法）；
+- `services`：替代班次列表。每列班次含 `service_id`、按**站序**排列的 `stops`（每站给出 `station`、UTC `arrival_at` / `departure_at`，首站只需发车、末站只需到达）以及每个相邻区段统一的核定容量 `capacity`；
+- `groups`：乘客组列表。每组含 `group_id`、`origin`、`destination`、最早可乘时刻 `ready_at` 与人数 `party_size`。
+
+**处理与选路规则**：
+
+- 乘客组按 `(ready_at, group_id)` 升序依次处理；
+- 每组**必须整体搭乘**同一行程，只有行程涉及的每个相邻区段剩余容量都 ≥ 全组人数时才能成行；
+- 选择**最早到达目的地**的行程：只能乘坐 `ready_at` 之后（含恰好相等）发车的班次，换乘仅可在两列班次共同停靠的车站进行且换乘间隔满足最小换乘秒数；
+- 到达时刻相同的行程依次取**换乘次数更少**、再取**班次 ID 序列字典序更小**者；
+- 成行后沿行程逐段扣减容量；中途下客释放后续区段容量，前一组占满的区段后一组不可再用；
+- 无法成行时返回滞留原因 `stranding.code`：
+  - `origin_not_served` / `destination_not_served`：起点 / 终点无任何替代班次停靠；
+  - `no_departure_after_ready`：`ready_at` 之后没有任何能到达目的地的班次（班次都已发车）；
+  - `no_feasible_connection`：替代班次网络在最小换乘约束下无法连通起终点（如缺反向车、换乘时间不足）；
+  - `insufficient_capacity`：存在可行路径，但每条路径都至少有一个相邻区段放不下整组。
+
+请求示例：
+
+```bash
+curl -X POST http://localhost:8000/disruption/replans \
+  -H "Content-Type: application/json" \
+  -d '{
+    "replan_id": "dr-2026-12-01-a",
+    "min_transfer_seconds": 600,
+    "services": [
+      {"service_id": "svc-A", "capacity": 30, "stops": [
+        {"station": "H", "arrival_at": null, "departure_at": "2026-12-01T08:00:00Z"},
+        {"station": "X", "arrival_at": "2026-12-01T08:30:00Z",
+         "departure_at": "2026-12-01T08:40:00Z"},
+        {"station": "W", "arrival_at": "2026-12-01T09:00:00Z", "departure_at": null}]},
+      {"service_id": "svc-B", "capacity": 50, "stops": [
+        {"station": "X", "arrival_at": "2026-12-01T08:45:00Z",
+         "departure_at": "2026-12-01T08:50:00Z"},
+        {"station": "Y", "arrival_at": "2026-12-01T09:20:00Z", "departure_at": null}]}
+    ],
+    "groups": [
+      {"group_id": "g1", "origin": "H", "destination": "W",
+       "ready_at": "2026-12-01T07:00:00Z", "party_size": 20},
+      {"group_id": "g2", "origin": "H", "destination": "Y",
+       "ready_at": "2026-12-01T07:30:00Z", "party_size": 15}
+    ]
+  }'
+```
+
+- 时间接受任意时区偏移并归一化为 UTC；`services` / `groups` 的数组顺序不影响载荷判定（服务按 `service_id`、组按 `(ready_at, group_id)` 规范化）。
+- **结构校验失败返回 `422` 且错误不落库**：`service_id` 或 `group_id` 重复、单列班次站点不唯一、首站缺发车 / 末站缺到达、到发时刻非单调（到达早于前站发车、或某站发车早于其到达）、起点终点相同、人数 `< 1`、最小换乘秒数为负等。
+- **幂等与冲突**：相同 `replan_id` + 相同载荷重复提交返回已固化结果（`status="duplicate"`，绝不重算）；相同 `replan_id` + 不同载荷返回 `409`。
+- **只追加、不可变、隔离**：结果在创建时一次性固化到独立的 `disruption_replans` 只追加表（存储层触发器禁止 `UPDATE` / `DELETE`）；重排只依据请求体计算，**不改动**事件、行程、账单、争议 / 退款，也**不追加审计记录**，不受任何既有业务数据影响。
+
+响应示例：
+
+```json
+{
+  "replan_id": "dr-2026-12-01-a",
+  "status": "created",
+  "min_transfer_seconds": 600,
+  "created_at": "2026-12-01T05:00:00Z",
+  "summary": {
+    "group_count": 2,
+    "assigned_count": 2,
+    "stranded_count": 0,
+    "total_passengers": 35,
+    "assigned_passengers": 35,
+    "stranded_passengers": 0
+  },
+  "services": [
+    {"service_id": "svc-A", "segment_capacities": [
+      {"from_station": "H", "to_station": "X", "capacity": 30, "remaining": 0},
+      {"from_station": "X", "to_station": "W", "capacity": 30, "remaining": 10}]},
+    {"service_id": "svc-B", "segment_capacities": [
+      {"from_station": "X", "to_station": "Y", "capacity": 50, "remaining": 35}]}
+  ],
+  "assignments": [
+    {"group_id": "g1", "origin": "H", "destination": "W",
+     "ready_at": "2026-12-01T07:00:00Z", "party_size": 20,
+     "status": "assigned", "arrived_at": "2026-12-01T09:00:00Z",
+     "transfers": 0, "services": ["svc-A"],
+     "itinerary": [
+       {"service_id": "svc-A", "board_station": "H", "alight_station": "W",
+        "board_at": "2026-12-01T08:00:00Z", "alight_at": "2026-12-01T09:00:00Z"}],
+     "stranding": null},
+    {"group_id": "g2", "origin": "H", "destination": "Y",
+     "ready_at": "2026-12-01T07:30:00Z", "party_size": 15,
+     "status": "assigned", "arrived_at": "2026-12-01T09:20:00Z",
+     "transfers": 1, "services": ["svc-A", "svc-B"],
+     "itinerary": [
+       {"service_id": "svc-A", "board_station": "H", "alight_station": "X",
+        "board_at": "2026-12-01T08:00:00Z", "alight_at": "2026-12-01T08:30:00Z"},
+       {"service_id": "svc-B", "board_station": "X", "alight_station": "Y",
+        "board_at": "2026-12-01T08:40:00Z", "alight_at": "2026-12-01T09:20:00Z"}],
+     "stranding": null}
+  ]
+}
+```
+
+滞留时对应行为 `"status": "stranded"`，`arrived_at` / `services` / `itinerary` 为空，`stranding` 给出原因码与说明，例如：
+
+```json
+{"group_id": "g3", "origin": "H", "destination": "Z",
+ "ready_at": "2026-12-01T07:00:00Z", "party_size": 15,
+ "status": "stranded", "arrived_at": null, "transfers": 0,
+ "services": [], "itinerary": [],
+ "stranding": {"code": "insufficient_capacity",
+               "message": "the group cannot be carried as a whole: every connecting journey is full on at least one adjacent segment"}}
+```
+
+`services` 中每个相邻区段都回显核定容量 `capacity` 与全部成行乘客组扣减后的剩余容量 `remaining`；`summary` 给出组数与人数的成行 / 滞留统计。
+
+### `GET /disruption/replans/{replan_id}` — 查询重排结果
+
+返回重排创建时固化的完整结果（`status` 固定为 `"created"`；重放标记只在 `POST` 响应中出现）。不存在返回 `404`。
+
+```bash
+curl http://localhost:8000/disruption/replans/dr-2026-12-01-a
+```
+
 ### `GET /config/fares` — 当前票价配置
 
 ## 业务审计链
@@ -571,7 +693,7 @@ curl http://localhost:8000/privacy/exports/pex-2026-11-15-a
 - 网络校验首次提交成功（无论是否通过）→ `network_validated`；网络快照固化成功 → `network_snapshot_created`；
 - 争议创建成功（冻结收费快照）→ `dispute_opened`；争议结案成功（写入不可变退款流水）→ `dispute_resolved`；
 - **重复请求不产生审计记录**：事件幂等重复（`duplicate`）、批次幂等重复（`duplicate`）、网络校验 / 快照幂等重复、争议 / 结案幂等重复（`duplicate`）、冲突（`409`）与校验失败（`422`）均不追加；
-- **只读分析不产生审计记录**：`POST /event-quality/scans` 只写其独立的只追加扫描表，`POST /privacy/exports` 只写其独立的只追加匿名导出表；两者都不触碰 `audit_log`，也不改动事件、行程、账单或争议数据；
+- **只读分析不产生审计记录**：`POST /event-quality/scans` 只写其独立的只追加扫描表，`POST /privacy/exports` 只写其独立的只追加匿名导出表，`POST /disruption/replans` 只写其独立的只追加重排表；三者都不触碰 `audit_log`，也不改动事件、行程、账单或争议数据；
 - 审计与业务数据同事务提交：业务写入（或审计写入）失败时一并回滚，不留半截记录。
 
 每条记录包含：全局序号 `seq`、操作类型 `operation`、UTC 时间 `occurred_at`、规范化请求摘要 `request_summary`（时间归一化、记录按流水号排序）、规范化结果摘要 `result_summary`、上一条哈希 `prev_hash` 与当前哈希 `record_hash`。哈希规则为对上述字段（含 `prev_hash`）做规范 JSON 后取 SHA-256；首条记录的 `prev_hash` 为空串。表上带有触发器，禁止任何 `UPDATE` / `DELETE`，记录只追加、不可修改。
